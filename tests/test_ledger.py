@@ -83,6 +83,144 @@ def test_aging_uses_daily_delta_table(conn):
     assert before == after
 
 
+# ------------------------------------------------------------- 乱序与统一判定序
+
+def test_out_of_order_csv_rows_accepted(conn):
+    """CSV 物理顺序乱序（引用行在前、被引用行在后），生效时刻合法即照常入账。"""
+    seed_invoices(conn)
+    text = (
+        "txn_id,txn_type,effective_at,amount_cents,receipt_id,invoice_id,allocation_id\n"
+        # 核销行写在收款行前面
+        "A1,allocation,2026-01-11T10:00:00Z,60000,R1,INV1,\n"
+        "R1,receipt,2026-01-10T09:00:00Z,80000,,,\n"
+        # 撤销行写在原核销行前面（同批内引用）
+        "U1,unallocation,2026-01-12T10:00:00Z,10000,,,A1\n"
+        # 冲正行写在收款行后面但时刻更早于核销
+        "V1,reversal,2026-01-10T12:00:00Z,5000,R1,,\n"
+    )
+    txns = ledger.parse_transactions_csv(text)
+    assert ledger.post_batch(conn, txns) == 4
+    receipts = {r["id"]: r for r in ledger.list_receipts(conn)}
+    # 80000 - 60000 + 10000 - 5000 = 25000
+    assert receipts["R1"]["available_cents"] == 25000
+    # 日增量与原始流水同事务生效：60000 - 10000 = 50000
+    delta = conn.execute(
+        "SELECT SUM(delta_cents) FROM invoice_daily_delta").fetchone()[0]
+    assert delta == 50000
+    report = ledger.aging_as_of(conn, date(2026, 2, 15))
+    assert report["rows"][0]["outstanding_cents"] == 50000
+
+
+def test_same_timestamp_tie_broken_by_id(conn):
+    """同一 UTC 时刻按编号定序：编号小的先生效。"""
+    seed_invoices(conn)
+    ledger.post_batch(conn, [
+        make_txn("R0", "receipt", "2026-01-10T09:00:00Z", 100),
+    ])
+    # 核销编号大于收款编号：收款先生效，合法
+    ledger.post_batch(conn, [
+        make_txn("Z9", "allocation", "2026-01-10T09:00:00Z", 50,
+                 receipt="R0", invoice="INV1"),
+    ])
+    assert ledger.list_receipts(conn)[0]["available_cents"] == 50
+    # 核销编号小于收款编号：核销先生效，原单未生效 -> 拒收
+    with pytest.raises(ledger.BatchError) as exc:
+        ledger.post_batch(conn, [
+            make_txn("R1", "receipt", "2026-01-11T09:00:00Z", 100),
+            make_txn("A0", "allocation", "2026-01-11T09:00:00Z", 50,
+                     receipt="R1", invoice="INV1"),
+        ])
+    assert exc.value.offender["id"] == "A0"
+    assert "尚未生效" in exc.value.message
+    assert conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0] == 1
+
+
+def test_mixed_balance_violation_and_missing_reference_earliest_wins(conn):
+    """余额为负与原单缺失并存：按 (生效时刻, 编号) 取首笔，不分错误类别。
+
+    补登冲正（01-12）使更晚的旧核销 A4（01-21）重放时把收款 R2 可用额
+    扣成负数；缺原单的撤销 U9 序位更晚（01-25）。应先报旧核销 A4 的编号
+    与原因，而不是更晚出现的“原单缺失”。
+    """
+    seed_invoices(conn)
+    ledger.post_batch(conn, [
+        make_txn("R2", "receipt", "2026-01-10T09:00:00Z", 50000),
+        make_txn("A4", "allocation", "2026-01-21T10:00:00Z", 50000,
+                 receipt="R2", invoice="INV2"),
+    ])
+    before_txns = ledger.list_transactions(conn)
+    before_aging = ledger.aging_as_of(conn, date(2026, 2, 15))
+
+    with pytest.raises(ledger.BatchError) as exc:
+        ledger.post_batch(conn, [
+            # 01-12 补登冲正 20000：R2 重放 50000-20000-50000=-20000，
+            # 旧核销 A4(01-21) 处可用额为负，违规序位 01-21
+            make_txn("V9", "reversal", "2026-01-12T10:00:00Z", 20000,
+                     receipt="R2"),
+            # 01-25 撤销不存在的核销：原单缺失，序位晚于 A4
+            make_txn("U9", "unallocation", "2026-01-25T00:00:00Z", 10,
+                     allocation="NOPE"),
+        ])
+    err = exc.value
+    assert err.offender["id"] == "A4"
+    assert "可用额" in err.message
+    # 整批拒收：原始流水与日汇总都不变
+    assert ledger.list_transactions(conn) == before_txns
+    assert ledger.aging_as_of(conn, date(2026, 2, 15)) == before_aging
+    assert conn.execute("SELECT COUNT(*) FROM allocations").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM unallocations").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM reversals").fetchone()[0] == 0
+
+
+def test_missing_reference_earlier_than_balance_violation_wins(conn):
+    """反向：缺原单的序位更早时先报缺原单，而不是更晚的余额违规。"""
+    seed_basic(conn)
+    with pytest.raises(ledger.BatchError) as exc:
+        ledger.post_batch(conn, [
+            make_txn("U8", "unallocation", "2026-01-02T00:00:00Z", 10,
+                     allocation="NOPE"),
+            make_txn("A8", "allocation", "2026-01-09T00:00:00Z", 999999,
+                     receipt="R1", invoice="INV1"),
+        ])
+    assert exc.value.offender["id"] == "U8"
+    assert "不存在" in exc.value.message
+
+
+def test_replay_scoped_to_affected_entities(conn):
+    """历史校验只查受本批影响的收款/发票/核销；无关实体保持原样且不干扰结果。"""
+    seed_basic(conn)
+    # 与本批完全无关的另一组收款/发票/核销
+    ledger.import_invoices(conn, [
+        {"id": "INV9", "invoice_date": "2026-03-01", "due_date": "2026-03-31",
+         "amount_cents": 70000},
+    ])
+    ledger.post_batch(conn, [
+        make_txn("R9", "receipt", "2026-03-02T00:00:00Z", 70000),
+        make_txn("A99", "allocation", "2026-03-03T00:00:00Z", 70000,
+                 receipt="R9", invoice="INV9"),
+    ])
+    # 合法补登只触及 R1 / INV1：撤销 A1 10000（01-12），
+    # 收款与发票各时点余额都非负；R9/INV9 不在受影响集合内
+    ledger.post_batch(conn, [
+        make_txn("U1", "unallocation", "2026-01-12T10:00:00Z", 10000,
+                 allocation="A1"),
+    ])
+    receipts = {r["id"]: r for r in ledger.list_receipts(conn)}
+    # R1 期末：80000 - (60000+20000) + 10000 = 10000
+    assert receipts["R1"]["available_cents"] == 10000
+    assert receipts["R9"]["available_cents"] == 0
+    # 违规补登同样不波及无关实体：冲正 30000 使旧核销 A2 处可用额为负
+    with pytest.raises(ledger.BatchError) as exc:
+        ledger.post_batch(conn, [
+            make_txn("V2", "reversal", "2026-01-13T10:00:00Z", 30000,
+                     receipt="R1"),
+        ])
+    assert exc.value.offender["id"] == "A2"
+    assert {r["id"] for r in ledger.list_receipts(conn)} == {"R1", "R9"}
+    assert conn.execute("SELECT COUNT(*) FROM unallocations").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM reversals").fetchone()[0] == 0
+
+
 # ------------------------------------------------------------- 迟到冲正
 
 def test_late_reversal_accepted_when_balances_hold(conn):

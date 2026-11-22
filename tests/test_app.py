@@ -54,6 +54,42 @@ def test_full_flow_via_web(client):
     assert "R1" in client.get("/receipts").get_data(as_text=True)
 
 
+def test_out_of_order_rows_no_longer_500(client):
+    """收款行写在核销行之后（但生效时刻更早）的合法乱序批次应正常入账。"""
+    upload(client, "/invoices/upload",
+           "invoice_id,invoice_date,due_date,amount_cents\n"
+           "INV1,2026-01-01,2026-01-31,100000\n")
+    r = upload(client, "/transactions/upload",
+               "txn_id,txn_type,effective_at,amount_cents,receipt_id,invoice_id,allocation_id\n"
+               "A1,allocation,2026-01-11T10:00:00Z,60000,R1,INV1,\n"
+               "R1,receipt,2026-01-10T09:00:00Z,80000,,,\n")
+    assert r.status_code == 200
+    assert "成功入账 2 笔流水" in r.get_data(as_text=True)
+    # 日汇总随原始流水一并生效
+    assert "400.00" in client.get("/aging?cutoff=2026-02-15").get_data(as_text=True)
+
+
+def test_mixed_errors_report_earliest_offender(client):
+    """余额为负与原单缺失并存：页面报序位更早的旧核销编号与原因，不返回 500。"""
+    upload(client, "/invoices/upload",
+           "invoice_id,invoice_date,due_date,amount_cents\n"
+           "INV2,2026-02-01,2026-02-28,50000\n")
+    upload(client, "/transactions/upload",
+           "txn_id,txn_type,effective_at,amount_cents,receipt_id,invoice_id,allocation_id\n"
+           "R2,receipt,2026-01-10T09:00:00Z,50000,,,\n"
+           "A4,allocation,2026-01-21T10:00:00Z,50000,R2,INV2,\n")
+    r = upload(client, "/transactions/upload",
+               "txn_id,txn_type,effective_at,amount_cents,receipt_id,invoice_id,allocation_id\n"
+               "V9,reversal,2026-01-12T10:00:00Z,20000,R2,,\n"
+               "U9,unallocation,2026-01-25T00:00:00Z,1000,,,NOPE\n")
+    body = r.get_data(as_text=True)
+    assert r.status_code == 200
+    assert "首笔违规记录 A4" in body and "可用额" in body
+    # 整批拒收：V9/U9 均未入账
+    listing = client.get("/transactions").get_data(as_text=True)
+    assert "V9" not in listing and "U9" not in listing
+
+
 def test_pages_render_on_empty_db(client):
     for path in ("/", "/invoices", "/receipts", "/transactions", "/aging",
                  "/invoices/upload", "/transactions/upload"):

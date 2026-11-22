@@ -305,29 +305,35 @@ def _post_batch_inner(conn: sqlite3.Connection, txns: list[dict]) -> None:
                 raise BatchError(f"编号 {t['id']} 已入账过，不能重复",
                                  offender=_offender(t))
 
-    # 2) 引用检查：原单须存在（库中或本批内）且已生效
-    #    （按 (生效时刻, 编号) 序在原单之后）。先于落库执行，
-    #    以免外键约束以 IntegrityError 形式报错。
-    batch_by_id = {t["id"]: t for t in txns}
-    for t in sorted(txns, key=lambda x: (x["effective_at"], x["id"])):
-        err = _check_reference(conn, t, batch_by_id)
-        if err:
-            raise BatchError(err, offender=_offender(t))
+    # 2) 引用与余额合并为一次全序重放：本批新流水与库中旧流水合并，
+    #    按 (UTC 生效时刻, 编号) 排序，依次判定。原单缺失、原单未生效、
+    #    三类余额为负都在这个顺序里取“首笔”，而不是分阶段各自取首笔。
+    #    只加载受本批影响的收款、发票与核销，不扫描无关历史流水。
+    first = _replay_affected(conn, txns)
+    if first is not None:
+        raise BatchError(
+            f"整批拒收：首笔违规记录 {first['id']}"
+            f"（{TYPE_LABELS[first['type']]}，生效于 {first['effective_at']} UTC）"
+            f"——{first['reason']}",
+            offender=first)
 
-    # 3) 落库（同一事务内，后面还要整体校验）
+    # 3) 全部通过后才落库。按外键依赖顺序插入（收款→核销→撤销/冲正），
+    #    这样 CSV 中引用行排在被引用行之后的乱序合法批次也能正常入账。
     for t in txns:
         if t["type"] == "receipt":
             conn.execute(
                 "INSERT INTO receipts (id, effective_at, amount_cents)"
                 " VALUES (?,?,?)",
                 (t["id"], t["effective_at"], t["amount_cents"]))
-        elif t["type"] == "allocation":
+    for t in txns:
+        if t["type"] == "allocation":
             conn.execute(
                 "INSERT INTO allocations (id, effective_at, receipt_id,"
                 " invoice_id, amount_cents) VALUES (?,?,?,?,?)",
                 (t["id"], t["effective_at"], t["receipt_id"],
                  t["invoice_id"], t["amount_cents"]))
-        elif t["type"] == "unallocation":
+    for t in txns:
+        if t["type"] == "unallocation":
             conn.execute(
                 "INSERT INTO unallocations (id, effective_at, allocation_id,"
                 " amount_cents) VALUES (?,?,?,?)",
@@ -340,38 +346,7 @@ def _post_batch_inner(conn: sqlite3.Connection, txns: list[dict]) -> None:
                 (t["id"], t["effective_at"], t["receipt_id"],
                  t["amount_cents"]))
 
-    # 4) 与库中旧流水合并，按 (生效时刻, 编号) 重放受影响实体，逐笔查非负
-    affected_receipts, affected_allocations, affected_invoices = set(), set(), set()
-    for t in txns:
-        if t["type"] == "receipt":
-            affected_receipts.add(t["id"])
-        elif t["type"] == "allocation":
-            affected_receipts.add(t["receipt_id"])
-            affected_invoices.add(t["invoice_id"])
-        elif t["type"] == "unallocation":
-            affected_allocations.add(t["allocation_id"])
-            ref = conn.execute(
-                "SELECT receipt_id, invoice_id FROM allocations WHERE id=?",
-                (t["allocation_id"],)).fetchone()
-            affected_receipts.add(ref["receipt_id"])
-            affected_invoices.add(ref["invoice_id"])
-        elif t["type"] == "reversal":
-            affected_receipts.add(t["receipt_id"])
-
-    violations = []
-    violations += _check_receipts(conn, affected_receipts)
-    violations += _check_allocations(conn, affected_allocations)
-    violations += _check_invoices(conn, affected_invoices)
-    if violations:
-        violations.sort(key=lambda v: (v["effective_at"], v["id"]))
-        first = violations[0]
-        raise BatchError(
-            f"整批拒收：首笔违规记录 {first['id']}"
-            f"（{TYPE_LABELS[first['type']]}，生效于 {first['effective_at']} UTC）"
-            f"——{first['reason']}",
-            offender=first)
-
-    # 5) 全部通过：维护账龄用的日增量汇总
+    # 4) 与原始流水同一事务维护账龄用日增量；整批拒收时两者都不生效
     _apply_daily_deltas(conn, txns)
 
 
@@ -380,124 +355,254 @@ def _offender(t: dict) -> dict:
             "effective_at": t["effective_at"], "reason": ""}
 
 
-def _check_reference(conn, t: dict, batch_by_id: dict) -> str | None:
-    key = (t["effective_at"], t["id"])
-    label = TYPE_LABELS[t["type"]]
-
-    def original_state(table, oid):
-        if oid in batch_by_id:                      # 原单在本批内
-            orig_eff = batch_by_id[oid]["effective_at"]
-        else:
-            row = conn.execute(f"SELECT effective_at FROM {table} WHERE id=?",
-                               (oid,)).fetchone()
-            if row is None:
-                return f"{label} {t['id']} 引用的原单 {oid} 不存在"
-            orig_eff = row["effective_at"]
-        if not ((orig_eff, oid) < key):
-            return (f"{label} {t['id']} 入账时原单 {oid} 尚未生效"
-                    f"（原单生效于 {orig_eff} UTC）")
-        return None
-
-    if t["type"] == "allocation":
-        err = original_state("receipts", t["receipt_id"])
-        if err:
-            return err
-        if not conn.execute("SELECT 1 FROM invoices WHERE id=?",
-                            (t["invoice_id"],)).fetchone():
-            return f"核销 {t['id']} 引用的发票 {t['invoice_id']} 不存在"
-    elif t["type"] == "unallocation":
-        return original_state("allocations", t["allocation_id"])
-    elif t["type"] == "reversal":
-        return original_state("receipts", t["receipt_id"])
-    return None
-
-
 def _violation(tid, ttype, eff, reason):
     return {"id": tid, "type": ttype, "effective_at": eff, "reason": reason}
 
 
-def _check_receipts(conn, receipt_ids) -> list[dict]:
-    """收款可用额 = 收款额 - 有效核销 - 冲正，逐笔不得为负。"""
-    out = []
-    for rid in sorted(receipt_ids):
-        r = conn.execute("SELECT amount_cents FROM receipts WHERE id=?",
-                         (rid,)).fetchone()
-        available = r["amount_cents"]
-        events = []
+def _affected_entities(txns: list[dict]) -> tuple[set, set, set]:
+    """收集受本批影响的收款、发票、核销编号（不访问数据库）。"""
+    receipts, invoices, allocations = set(), set(), set()
+    for t in txns:
+        if t["type"] == "receipt":
+            receipts.add(t["id"])
+        elif t["type"] == "allocation":
+            receipts.add(t["receipt_id"])
+            invoices.add(t["invoice_id"])
+        elif t["type"] == "unallocation":
+            allocations.add(t["allocation_id"])
+        elif t["type"] == "reversal":
+            receipts.add(t["receipt_id"])
+    return receipts, allocations, invoices
+
+
+def _replay_affected(conn: sqlite3.Connection,
+                     txns: list[dict]) -> dict | None:
+    """合并本批与库中受影响实体的全部流水，按 (生效时刻, 编号) 全序重放。
+
+    返回首笔违规记录（含原因）；全部合法则返回 None。校验只读内存合并集，
+    不向任何流水表写入，因此拒收时调用方回滚即可，原账不受影响。
+    """
+    receipts, allocations, invoices = _affected_entities(txns)
+    batch_by_id = {t["id"]: t for t in txns}
+
+    # 撤销/冲正的原单若在本批内，其关联实体也进入受影响集合
+    for t in txns:
+        if t["type"] == "unallocation" and t["allocation_id"] in batch_by_id:
+            orig = batch_by_id[t["allocation_id"]]
+            receipts.add(orig["receipt_id"])
+            invoices.add(orig["invoice_id"])
+
+    # 本批核销的原单信息（库中或批内），供撤销事件定位收款/发票
+    alloc_meta = {}
+    for aid in allocations:
+        if aid in batch_by_id:
+            a = batch_by_id[aid]
+            alloc_meta[aid] = (a["receipt_id"], a["invoice_id"])
+        else:
+            row = conn.execute(
+                "SELECT receipt_id, invoice_id FROM allocations WHERE id=?",
+                (aid,)).fetchone()
+            if row is not None:
+                alloc_meta[aid] = (row["receipt_id"], row["invoice_id"])
+
+    # 受影响收款 / 发票的库中初始余额；本批新增收款初始额取批内金额
+    receipt_amount = {}
+    for rid in receipts:
+        if rid in batch_by_id:
+            receipt_amount[rid] = batch_by_id[rid]["amount_cents"]
+        else:
+            row = conn.execute(
+                "SELECT amount_cents FROM receipts WHERE id=?",
+                (rid,)).fetchone()
+            if row is not None:
+                receipt_amount[rid] = row["amount_cents"]
+
+    invoice_amount = {}
+    for iid in invoices:
+        row = conn.execute(
+            "SELECT amount_cents FROM invoices WHERE id=?",
+            (iid,)).fetchone()
+        if row is not None:
+            invoice_amount[iid] = row["amount_cents"]
+
+    # 受影响核销的初始可撤额（库中核销额；本批核销取批内金额）
+    allocation_amount = {}
+    for aid in allocations:
+        if aid in batch_by_id:
+            allocation_amount[aid] = batch_by_id[aid]["amount_cents"]
+        else:
+            row = conn.execute(
+                "SELECT amount_cents FROM allocations WHERE id=?",
+                (aid,)).fetchone()
+            if row is not None:
+                allocation_amount[aid] = row["amount_cents"]
+
+    # 加载受影响实体在库中的历史事件
+    receipt_events = {rid: [] for rid in receipts}
+    invoice_events = {iid: [] for iid in invoices}
+    allocation_events = {aid: [] for aid in allocations}
+
+    def add_receipt_event(rid, eff, tid, ttype, delta):
+        if rid in receipt_events:
+            receipt_events[rid].append((eff, tid, ttype, delta))
+
+    def add_invoice_event(iid, eff, tid, ttype, delta):
+        if iid in invoice_events:
+            invoice_events[iid].append((eff, tid, ttype, delta))
+
+    def add_allocation_event(aid, eff, tid, amount):
+        if aid in allocation_events:
+            allocation_events[aid].append((eff, tid, amount))
+
+    if receipts:
+        marks = ",".join("?" for _ in receipts)
         for a in conn.execute(
-                "SELECT id, effective_at, amount_cents FROM allocations"
-                " WHERE receipt_id=?", (rid,)):
-            events.append((a["effective_at"], a["id"], "allocation",
-                           -a["amount_cents"]))
+                f"SELECT id, effective_at, amount_cents, receipt_id, invoice_id"
+                f" FROM allocations WHERE receipt_id IN ({marks})",
+                tuple(receipts)):
+            add_receipt_event(a["receipt_id"], a["effective_at"], a["id"],
+                              "allocation", -a["amount_cents"])
         for u in conn.execute(
-                "SELECT u.id, u.effective_at, u.amount_cents FROM unallocations u"
-                " JOIN allocations a ON a.id = u.allocation_id"
-                " WHERE a.receipt_id=?", (rid,)):
-            events.append((u["effective_at"], u["id"], "unallocation",
-                           u["amount_cents"]))
+                f"SELECT u.id, u.effective_at, u.amount_cents, a.receipt_id,"
+                f" a.invoice_id FROM unallocations u JOIN allocations a"
+                f" ON a.id = u.allocation_id"
+                f" WHERE a.receipt_id IN ({marks})", tuple(receipts)):
+            add_receipt_event(u["receipt_id"], u["effective_at"], u["id"],
+                              "unallocation", u["amount_cents"])
+            add_invoice_event(u["invoice_id"], u["effective_at"], u["id"],
+                              "unallocation", u["amount_cents"])
         for v in conn.execute(
-                "SELECT id, effective_at, amount_cents FROM reversals"
-                " WHERE receipt_id=?", (rid,)):
-            events.append((v["effective_at"], v["id"], "reversal",
-                           -v["amount_cents"]))
-        events.sort(key=lambda e: (e[0], e[1]))
-        for eff, tid, ttype, delta in events:
+                f"SELECT id, effective_at, amount_cents, receipt_id"
+                f" FROM reversals WHERE receipt_id IN ({marks})",
+                tuple(receipts)):
+            add_receipt_event(v["receipt_id"], v["effective_at"], v["id"],
+                              "reversal", -v["amount_cents"])
+    if invoices:
+        marks = ",".join("?" for _ in invoices)
+        for a in conn.execute(
+                f"SELECT id, effective_at, amount_cents, receipt_id, invoice_id"
+                f" FROM allocations WHERE invoice_id IN ({marks})",
+                tuple(invoices)):
+            add_invoice_event(a["invoice_id"], a["effective_at"], a["id"],
+                              "allocation", -a["amount_cents"])
+    if allocations:
+        marks = ",".join("?" for _ in allocations)
+        for u in conn.execute(
+                f"SELECT id, effective_at, amount_cents, allocation_id"
+                f" FROM unallocations WHERE allocation_id IN ({marks})",
+                tuple(allocations)):
+            add_allocation_event(u["allocation_id"], u["effective_at"],
+                                 u["id"], u["amount_cents"])
+
+    # 合并本批新事件
+    for t in txns:
+        eff, tid, ttype = t["effective_at"], t["id"], t["type"]
+        if ttype == "allocation":
+            add_receipt_event(t["receipt_id"], eff, tid, ttype,
+                              -t["amount_cents"])
+            add_invoice_event(t["invoice_id"], eff, tid, ttype,
+                              -t["amount_cents"])
+        elif ttype == "unallocation":
+            meta = alloc_meta.get(t["allocation_id"])
+            if meta is not None:
+                rid, iid = meta
+                add_receipt_event(rid, eff, tid, ttype, t["amount_cents"])
+                add_invoice_event(iid, eff, tid, ttype, t["amount_cents"])
+            add_allocation_event(t["allocation_id"], eff, tid,
+                                 t["amount_cents"])
+        elif ttype == "reversal":
+            add_receipt_event(t["receipt_id"], eff, tid, ttype,
+                              -t["amount_cents"])
+
+    first = None
+
+    def note(violation):
+        # 全序首笔：先按 (生效时刻, 编号)，同一事件上的多个原因保留先出现者
+        nonlocal first
+        key = (violation["effective_at"], violation["id"])
+        if first is None or key < (first["effective_at"], first["id"]):
+            first = violation
+
+    def check_reference(t):
+        """原单缺失 / 原单未生效；错误位置记在引用方自己的序位上。"""
+        key = (t["effective_at"], t["id"])
+
+        def original_state(table, oid):
+            if oid in batch_by_id:
+                orig_eff = batch_by_id[oid]["effective_at"]
+            else:
+                row = conn.execute(
+                    f"SELECT effective_at FROM {table} WHERE id=?",
+                    (oid,)).fetchone()
+                if row is None:
+                    note(_violation(
+                        t["id"], t["type"], t["effective_at"],
+                        f"引用的原单 {oid} 不存在"))
+                    return
+                orig_eff = row["effective_at"]
+            if not ((orig_eff, oid) < key):
+                note(_violation(
+                    t["id"], t["type"], t["effective_at"],
+                    f"入账时原单 {oid} 尚未生效"
+                    f"（原单生效于 {orig_eff} UTC）"))
+
+        if t["type"] == "allocation":
+            original_state("receipts", t["receipt_id"])
+            if t["invoice_id"] not in invoice_amount:
+                note(_violation(
+                    t["id"], t["type"], t["effective_at"],
+                    f"引用的发票 {t['invoice_id']} 不存在"))
+        elif t["type"] == "unallocation":
+            original_state("allocations", t["allocation_id"])
+        elif t["type"] == "reversal":
+            original_state("receipts", t["receipt_id"])
+
+    # 引用判定同样按全序进行，保证与余额违规在同一顺序里竞争“首笔”
+    for t in sorted(txns, key=lambda x: (x["effective_at"], x["id"])):
+        check_reference(t)
+
+    # 收款可用额重放：收款额 + 撤销核销 - 核销 - 冲正，逐笔不得为负
+    for rid, events in receipt_events.items():
+        available = receipt_amount.get(rid)
+        if available is None:
+            # 收款本身缺失：引用它的新流水已在引用检查中报“原单不存在”，
+            # 库中流水不会引用不存在的收款，这里无需再报
+            continue
+        for eff, tid, ttype, delta in sorted(events, key=lambda e: (e[0], e[1])):
             available += delta
             if available < 0:
-                out.append(_violation(
+                note(_violation(
                     tid, ttype, eff,
                     f"入账后收款 {rid} 可用额为 {available} 分（为负）"))
                 break
-    return out
 
-
-def _check_allocations(conn, allocation_ids) -> list[dict]:
-    """原核销可撤额 = 核销额 - 已撤销额，逐笔不得为负。"""
-    out = []
-    for aid in sorted(allocation_ids):
-        a = conn.execute("SELECT amount_cents FROM allocations WHERE id=?",
-                         (aid,)).fetchone()
-        revocable = a["amount_cents"]
-        for u in conn.execute(
-                "SELECT id, effective_at, amount_cents FROM unallocations"
-                " WHERE allocation_id=? ORDER BY effective_at, id", (aid,)):
-            revocable -= u["amount_cents"]
-            if revocable < 0:
-                out.append(_violation(
-                    u["id"], "unallocation", u["effective_at"],
-                    f"入账后核销 {aid} 可撤额为 {revocable} 分（为负）"))
-                break
-    return out
-
-
-def _check_invoices(conn, invoice_ids) -> list[dict]:
-    """发票未核销额 = 发票额 - 有效核销，逐笔不得为负。"""
-    out = []
-    for iid in sorted(invoice_ids):
-        inv = conn.execute("SELECT amount_cents FROM invoices WHERE id=?",
-                           (iid,)).fetchone()
-        outstanding = inv["amount_cents"]
-        events = []
-        for a in conn.execute(
-                "SELECT id, effective_at, amount_cents FROM allocations"
-                " WHERE invoice_id=?", (iid,)):
-            events.append((a["effective_at"], a["id"], "allocation",
-                           -a["amount_cents"]))
-        for u in conn.execute(
-                "SELECT u.id, u.effective_at, u.amount_cents FROM unallocations u"
-                " JOIN allocations a ON a.id = u.allocation_id"
-                " WHERE a.invoice_id=?", (iid,)):
-            events.append((u["effective_at"], u["id"], "unallocation",
-                           u["amount_cents"]))
-        events.sort(key=lambda e: (e[0], e[1]))
-        for eff, tid, ttype, delta in events:
+    # 发票未核销额重放：发票额 - 核销 + 撤销核销，逐笔不得为负
+    for iid, events in invoice_events.items():
+        outstanding = invoice_amount.get(iid)
+        if outstanding is None:
+            continue
+        for eff, tid, ttype, delta in sorted(events, key=lambda e: (e[0], e[1])):
             outstanding += delta
             if outstanding < 0:
-                out.append(_violation(
+                note(_violation(
                     tid, ttype, eff,
                     f"入账后发票 {iid} 未核销额为 {outstanding} 分（为负）"))
                 break
-    return out
+
+    # 原核销可撤额重放：核销额 - 累计撤销，逐笔不得为负
+    for aid, events in allocation_events.items():
+        revocable = allocation_amount.get(aid)
+        if revocable is None:
+            continue
+        for eff, tid, amount in sorted(events, key=lambda e: (e[0], e[1])):
+            revocable -= amount
+            if revocable < 0:
+                note(_violation(
+                    tid, "unallocation", eff,
+                    f"入账后核销 {aid} 可撤额为 {revocable} 分（为负）"))
+                break
+
+    return first
 
 
 def _apply_daily_deltas(conn, txns) -> None:
